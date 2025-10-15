@@ -119,6 +119,7 @@ class ExerciseEntry(BaseModel):
     assigned_time: time
     schedule: str
     period: Literal["morning", "afternoon", "night"]
+    exercise_video: Optional[str] = None
     completed_timestamp: Optional[datetime] = None
 
 

@@ -329,6 +329,16 @@ def fhir_exercise_resources(uhid: str, rehab: RehabSection) -> dict:
             "note": [{"text": f"Progress: {ex.progress_percentage}%"}],
             "meta": {"profile": [f"{FHIR_BASE_PROFILE}/Task"]}
         }
+
+        # ✅ Add exercise video if available
+        if ex.exercise_video:
+            task["input"] = [
+                {
+                    "type": {"text": "Exercise Video"},
+                    "valueUrl": ex.exercise_video
+                }
+            ]
+
         entries.append({"resource": task, "request": {"method": "POST", "url": "Task"}})
 
     return {"resourceType": "Bundle", "type": "transaction", "entry": entries}

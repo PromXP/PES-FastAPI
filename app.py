@@ -32,6 +32,7 @@ from models import (
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 from db import fhir_patient_resource,fhir_surgery_resources,fhir_consent_resource,fhir_preop_checklist_resources,fhir_slot_booking_resource,fhir_billing_resource,fhir_watchdata_resources,fhir_meal_resources,fhir_medication_resources
+from azure.storage.blob import BlobServiceClient
 
 # Load .env file (only needed locally; in production, use system env vars)
 load_dotenv()
@@ -44,6 +45,10 @@ CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
 CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+# Azure Blob Storage config from .env
+ACCOUNT_URL = os.getenv("AZURE_ACCOUNT_URL")
+ACCOUNT_KEY = os.getenv("AZURE_ACCOUNT_KEY")
+CONTAINER_NAME = os.getenv("CONTAINER_NAME", "profile-picture")
 
 credential = ClientSecretCredential(
     tenant_id=TENANT_ID,
@@ -64,6 +69,17 @@ def get_headers():
 
 app = FastAPI()
 scheduler = BackgroundScheduler()
+
+# Initialize Blob service client
+blob_service_client = BlobServiceClient(account_url=ACCOUNT_URL, credential=ACCOUNT_KEY)
+container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+
+# Ensure container exists
+try:
+    container_client.create_container()
+    print(f"✅ Container '{CONTAINER_NAME}' created.")
+except Exception:
+    print(f"ℹ Container '{CONTAINER_NAME}' already exists.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -865,7 +881,7 @@ scheduler.start()
 # ---------------------- REHAB ----------------------
 @app.post("/rehab/exercises", response_model=dict)
 async def post_exercises(uhid: str, exercises: List[ExerciseEntry]):
-    """Post exercises separately."""
+    """Post exercises separately to Azure FHIR as Task resources."""
     headers = get_headers()
     try:
         for ex in exercises:
@@ -882,13 +898,37 @@ async def post_exercises(uhid: str, exercises: List[ExerciseEntry]):
                 },
                 "note": [{"text": f"Progress: {ex.progress_percentage}%"}]
             }
+
+            # ✅ Add exercise video in a FHIR-compliant way
+            if ex.exercise_video:
+                task["input"] = [
+                    {
+                        "type": {
+                            "coding": [
+                                {
+                                    "system": "http://terminology.hl7.org/CodeSystem/task-input-type",
+                                    "code": "attachment",
+                                    "display": "Exercise Video"
+                                }
+                            ],
+                            "text": "Exercise Video URL"
+                        },
+                        "valueUrl": ex.exercise_video
+                    }
+                ]
+
             response = requests.post(f"{FHIR_URL}/Task", json=task, headers=headers)
             if response.status_code >= 400:
-                return {"success": False, "message": f"Error posting Task: {response.status_code} {response.text}"}
+                return {
+                    "success": False,
+                    "message": f"Error posting Task: {response.status_code} {response.text}"
+                }
 
         return {"success": True, "message": f"{len(exercises)} exercise(s) posted successfully."}
+
     except Exception as e:
         return {"success": False, "message": str(e)}
+
 
 @app.post("/rehab/instructions", response_model=dict)
 async def post_instructions(uhid: str, instructions: List[RehabInstructions]):
@@ -915,25 +955,55 @@ async def post_instructions(uhid: str, instructions: List[RehabInstructions]):
 
 @app.get("/rehab/exercises", response_model=dict)
 def get_exercises(uhid: str):
-    """Fetch exercises for a patient."""
+    """Fetch exercises for a patient from Azure FHIR."""
     headers = get_headers()
     exercises = []
     try:
-        response = requests.get(f"{FHIR_URL}/Task", headers=headers, params={"subject": f"Patient/{uhid}"})
+        response = requests.get(
+            f"{FHIR_URL}/Task",
+            headers=headers,
+            params={"subject": f"Patient/{uhid}"}
+        )
         data = response.json()
+
         for entry in data.get("entry", []):
             res = entry.get("resource", {})
-            if res.get("resourceType") == "Task":
-                exercises.append({
-                    "name": res.get("description"),
-                    "status": res.get("status"),
-                    "execution_period": res.get("executionPeriod"),
-                    "progress_notes": [note.get("text") for note in res.get("note", [])],
-                    "id": res.get("id")
-                })
+            if res.get("resourceType") != "Task":
+                continue
+
+            # 🟢 Extract exercise video URL if present
+            video_url = None
+            for inp in res.get("input", []):
+                if "valueUrl" in inp:
+                    video_url = inp["valueUrl"]
+                    break
+
+            # 🟢 Extract progress percentage (from note text if present)
+            progress_notes = [note.get("text") for note in res.get("note", [])]
+            progress_percentage = None
+            for note in progress_notes:
+                if note and "Progress:" in note:
+                    try:
+                        progress_percentage = float(note.split("Progress:")[1].replace("%", "").strip())
+                    except:
+                        pass
+
+            exercises.append({
+                "id": res.get("id"),
+                "name": res.get("description"),
+                "status": res.get("status"),
+                "execution_period": res.get("executionPeriod"),
+                "progress_percentage": progress_percentage,
+                "exercise_video": video_url,
+                "completed_timestamp": res.get("executionPeriod", {}).get("end"),
+                "progress_notes": progress_notes
+            })
+
         return {"success": True, "exercises": exercises}
+
     except Exception as e:
         return {"success": False, "exercises": [], "error": str(e)}
+
 
 
 @app.get("/rehab/instructions", response_model=dict)
@@ -970,6 +1040,103 @@ def get_rehab_instructions(uhid: str):
 
     except Exception as e:
         return {"success": False, "instructions": [], "error": str(e)}
+    
+@app.get("/rehab/exercises/in-progress", response_model=dict)
+def get_in_progress_exercises(uhid: str):
+    """Fetch all in-progress exercises for a patient by UHID."""
+    headers = get_headers()
+    exercises = []
+    try:
+        # Query all Tasks for that UHID
+        response = requests.get(
+            f"{FHIR_URL}/Task",
+            headers=headers,
+            params={"subject": f"Patient/{uhid}"}
+        )
+
+        if response.status_code != 200:
+            return {"success": False, "message": f"FHIR fetch error: {response.status_code} {response.text}"}
+
+        data = response.json()
+        for entry in data.get("entry", []):
+            res = entry.get("resource", {})
+            # Only pick in-progress tasks
+            if res.get("resourceType") == "Task" and res.get("status") == "in-progress":
+                exercises.append({
+                    "id": res.get("id"),
+                    "name": res.get("description"),
+                    "status": res.get("status"),
+                    "execution_period": res.get("executionPeriod"),
+                    "progress_notes": [note.get("text") for note in res.get("note", [])],
+                })
+
+        return {"success": True, "in_progress_exercises": exercises}
+    except Exception as e:
+        return {"success": False, "in_progress_exercises": [], "error": str(e)}
+
+    
+@app.delete("/rehab/exercises", response_model=dict)
+def delete_exercise(uhid: str, exercise_name: str):
+    """
+    Delete a Task (exercise) for a given UHID and exercise name 
+    only if it is not completed (status = 'in-progress').
+    """
+    headers = get_headers()
+    try:
+        # 1️⃣ Fetch all tasks for the patient
+        response = requests.get(
+            f"{FHIR_URL}/Task",
+            headers=headers,
+            params={"subject": f"Patient/{uhid}"}
+        )
+        if response.status_code >= 400:
+            return {
+                "success": False,
+                "message": f"Error fetching Tasks: {response.status_code} {response.text}"
+            }
+
+        data = response.json()
+        deleted_count = 0
+
+        # 2️⃣ Filter and delete tasks matching criteria
+        for entry in data.get("entry", []):
+            res = entry.get("resource", {})
+            if res.get("resourceType") != "Task":
+                continue
+
+            task_id = res.get("id")
+            task_name = res.get("description", "")
+            task_status = res.get("status")
+
+            if (
+                task_status == "in-progress"
+                and exercise_name.lower() in task_name.lower()
+            ):
+                delete_url = f"{FHIR_URL}/Task/{task_id}"
+                del_response = requests.delete(delete_url, headers=headers)
+
+                if del_response.status_code in (200, 204):
+                    deleted_count += 1
+                else:
+                    return {
+                        "success": False,
+                        "message": f"Error deleting Task {task_id}: {del_response.text}"
+                    }
+
+        if deleted_count == 0:
+            return {
+                "success": False,
+                "message": f"No in-progress exercise named '{exercise_name}' found for UHID {uhid}."
+            }
+
+        return {
+            "success": True,
+            "message": f"Deleted {deleted_count} exercise(s) named '{exercise_name}' for UHID {uhid}."
+        }
+
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
     
 # ---------------------- MEALS ----------------------
 @app.post("/fhir/meals", response_model=dict)
@@ -1058,3 +1225,42 @@ def verify_payment(request: VerifyPaymentRequest):
         return {"success": True, "message": "Payment verified successfully"}
     except razorpay.errors.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid payment signature")
+    
+@app.post("/upload-image", response_model=dict)
+async def upload_image(file: UploadFile = File(...)):
+    """
+    Upload an image file to Azure Blob Storage.
+    Returns the URL of the uploaded blob.
+    """
+    try:
+        blob_name = file.filename
+        blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=blob_name)
+
+        # Read file contents and upload
+        file_data = await file.read()
+        blob_client.upload_blob(file_data, overwrite=True)
+
+        blob_url = f"{ACCOUNT_URL}{CONTAINER_NAME}/{blob_name}"
+        return {"success": True, "blob_url": blob_url, "file_name": blob_name}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    
+@app.get("/list-blobs", response_model=dict)
+def list_blobs():
+    """
+    List all blobs in the container and return their URLs.
+    """
+    try:
+        blobs = []
+        for blob in container_client.list_blobs():
+            blob_url = f"{ACCOUNT_URL}{CONTAINER_NAME}/{blob.name}"
+            blobs.append({
+                "name": blob.name,
+                "url": blob_url
+            })
+
+        return {"success": True, "blobs": blobs}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
