@@ -1,5 +1,5 @@
 attr==0.3.2
-APScheduler==3.12.0
+APScheduler==3.11.0
 colorama==0.4.6
 ConfigParser==7.2.0
 cryptography==41.0.4
