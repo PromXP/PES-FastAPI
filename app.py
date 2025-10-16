@@ -5,7 +5,6 @@ from typing import List, Optional
 from fastapi import  BackgroundTasks, Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, BackgroundTasks, Query, Form, File, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 import os
 import boto3
 import razorpay
@@ -33,9 +32,6 @@ from models import (
 from apscheduler.schedulers.background import BackgroundScheduler
 from db import fhir_patient_resource,fhir_surgery_resources,fhir_consent_resource,fhir_preop_checklist_resources,fhir_slot_booking_resource,fhir_billing_resource,fhir_watchdata_resources,fhir_meal_resources,fhir_medication_resources
 from azure.storage.blob import BlobServiceClient
-
-# Load .env file (only needed locally; in production, use system env vars)
-load_dotenv()
 
 # Get environment variables
 FHIR_URL = os.getenv("FHIR_URL")
@@ -1263,4 +1259,5 @@ def list_blobs():
         return {"success": True, "blobs": blobs}
 
     except Exception as e:
+
         return {"success": False, "error": str(e)}
