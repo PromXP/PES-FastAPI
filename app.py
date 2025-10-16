@@ -6,7 +6,6 @@ from fastapi import  BackgroundTasks, Body, FastAPI, HTTPException, Request, Web
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 import os
-import boto3
 import razorpay
 import requests
 from azure.identity import ClientSecretCredential
@@ -1261,3 +1260,4 @@ def list_blobs():
     except Exception as e:
 
         return {"success": False, "error": str(e)}
+
