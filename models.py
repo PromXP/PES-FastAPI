@@ -117,6 +117,7 @@ class ExerciseEntry(BaseModel):
     progress_percentage: float
     assigned_date: date
     assigned_time: time
+    duration_days: int
     schedule: str
     period: Literal["morning", "afternoon", "night"]
     exercise_video: Optional[str] = None

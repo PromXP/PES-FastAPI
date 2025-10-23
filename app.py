@@ -616,7 +616,7 @@ def get_medications(uhid: str):
 def get_active_medications(uhid: str):
     """
     Fetch all active medications for a given patient UHID.
-    Returns medication name, status, dosage, authored date, and notes (doses taken).
+    Returns medication name, status, dosage, authored date, duration_days, and doses taken.
     """
     try:
         headers = get_headers()
@@ -630,20 +630,27 @@ def get_active_medications(uhid: str):
             for entry in data.get("entry", []):
                 res = entry.get("resource", {})
 
-                # Extract key fields
                 med_name = res.get("medicationCodeableConcept", {}).get("text", "Unknown")
                 status = res.get("status", "unknown")
                 authored_on = res.get("authoredOn", "")
                 dosage = res.get("dosageInstruction", [{}])[0].get("text", "")
                 note_text = res.get("note", [{}])[0].get("text", "[]")
 
-                # Try parsing doses_taken JSON (if it’s stored as JSON string)
+                # ✅ Parse doses_taken JSON safely
                 import json
-                doses_taken = []
                 try:
                     doses_taken = json.loads(note_text)
                 except Exception:
-                    doses_taken = [note_text]  # fallback if note isn't JSON
+                    doses_taken = [note_text]
+
+                # ✅ Extract duration_days from dosageInstruction.repeat.boundsDuration
+                duration_days = None
+                dosage_instr = res.get("dosageInstruction", [])
+                if dosage_instr:
+                    timing = dosage_instr[0].get("timing", {})
+                    repeat = timing.get("repeat", {})
+                    bounds = repeat.get("boundsDuration", {})
+                    duration_days = bounds.get("value")
 
                 all_active_meds.append({
                     "id": res.get("id"),
@@ -651,11 +658,15 @@ def get_active_medications(uhid: str):
                     "status": status,
                     "dosage": dosage,
                     "authoredOn": authored_on,
+                    "duration_days": duration_days,
                     "doses_taken": doses_taken
                 })
 
             # Handle pagination
-            next_link = next((link.get("url") for link in data.get("link", []) if link.get("relation") == "next"), None)
+            next_link = next(
+                (link.get("url") for link in data.get("link", []) if link.get("relation") == "next"),
+                None
+            )
             url = next_link
 
         return {
@@ -666,6 +677,7 @@ def get_active_medications(uhid: str):
 
     except Exception as e:
         return {"success": False, "error": str(e)}
+
 
 @app.delete("/fhir/delete-active-medicine")
 def delete_active_medicine(uhid: str, tablet_name: str):
@@ -891,10 +903,14 @@ async def post_exercises(uhid: str, exercises: List[ExerciseEntry]):
                     "start": f"{ex.assigned_date}T{ex.assigned_time}",
                     "end": ex.completed_timestamp.isoformat() if ex.completed_timestamp else None
                 },
-                "note": [{"text": f"Progress: {ex.progress_percentage}%"}]
+                # ✅ Include both progress and duration_days
+                "note": [
+                    {"text": f"Progress: {ex.progress_percentage}%"},
+                    {"text": f"Duration Days: {ex.duration_days}"}
+                ]
             }
 
-            # ✅ Add exercise video in a FHIR-compliant way
+            # Add exercise video in a FHIR-compliant way
             if ex.exercise_video:
                 task["input"] = [
                     {
@@ -925,6 +941,7 @@ async def post_exercises(uhid: str, exercises: List[ExerciseEntry]):
         return {"success": False, "message": str(e)}
 
 
+
 @app.post("/rehab/instructions", response_model=dict)
 async def post_instructions(uhid: str, instructions: List[RehabInstructions]):
     """Post rehab instructions separately."""
@@ -953,6 +970,7 @@ def get_exercises(uhid: str):
     """Fetch exercises for a patient from Azure FHIR."""
     headers = get_headers()
     exercises = []
+
     try:
         response = requests.get(
             f"{FHIR_URL}/Task",
@@ -966,22 +984,35 @@ def get_exercises(uhid: str):
             if res.get("resourceType") != "Task":
                 continue
 
-            # 🟢 Extract exercise video URL if present
+            # Extract exercise video URL if present
             video_url = None
             for inp in res.get("input", []):
-                if "valueUrl" in inp:
+                if inp.get("valueUrl"):
                     video_url = inp["valueUrl"]
-                    break
 
-            # 🟢 Extract progress percentage (from note text if present)
-            progress_notes = [note.get("text") for note in res.get("note", [])]
+            # Extract progress percentage and duration_days from notes
             progress_percentage = None
-            for note in progress_notes:
-                if note and "Progress:" in note:
+            duration_days = None
+            progress_notes = []
+
+            for note in res.get("note", []):
+                text = note.get("text")
+                if not text:
+                    continue
+
+                progress_notes.append(text)
+
+                if text.startswith("Progress:"):
                     try:
-                        progress_percentage = float(note.split("Progress:")[1].replace("%", "").strip())
-                    except:
-                        pass
+                        progress_percentage = float(text.split("Progress:")[1].replace("%", "").strip())
+                    except ValueError:
+                        progress_percentage = None
+
+                elif text.startswith("Duration Days:"):
+                    try:
+                        duration_days = int(text.split("Duration Days:")[1].strip())
+                    except ValueError:
+                        duration_days = None
 
             exercises.append({
                 "id": res.get("id"),
@@ -990,6 +1021,7 @@ def get_exercises(uhid: str):
                 "execution_period": res.get("executionPeriod"),
                 "progress_percentage": progress_percentage,
                 "exercise_video": video_url,
+                "duration_days": duration_days,
                 "completed_timestamp": res.get("executionPeriod", {}).get("end"),
                 "progress_notes": progress_notes
             })
@@ -998,6 +1030,7 @@ def get_exercises(uhid: str):
 
     except Exception as e:
         return {"success": False, "exercises": [], "error": str(e)}
+
 
 
 
@@ -1042,7 +1075,6 @@ def get_in_progress_exercises(uhid: str):
     headers = get_headers()
     exercises = []
     try:
-        # Query all Tasks for that UHID
         response = requests.get(
             f"{FHIR_URL}/Task",
             headers=headers,
@@ -1050,25 +1082,48 @@ def get_in_progress_exercises(uhid: str):
         )
 
         if response.status_code != 200:
-            return {"success": False, "message": f"FHIR fetch error: {response.status_code} {response.text}"}
+            return {
+                "success": False,
+                "message": f"FHIR fetch error: {response.status_code} {response.text}"
+            }
 
         data = response.json()
         for entry in data.get("entry", []):
             res = entry.get("resource", {})
-            # Only pick in-progress tasks
             if res.get("resourceType") == "Task" and res.get("status") == "in-progress":
+                
+                # Extract progress_percentage and duration_days from notes
+                progress_percentage = None
+                duration_days = None
+                progress_notes = []
+                for note in res.get("note", []):
+                    text = note.get("text")
+                    progress_notes.append(text)
+                    if text and "Progress:" in text:
+                        try:
+                            progress_percentage = float(text.split("Progress:")[1].replace("%", "").strip())
+                        except:
+                            pass
+                    if text and "Duration Days:" in text:
+                        try:
+                            duration_days = int(text.split("Duration Days:")[1].strip())
+                        except:
+                            pass
+
                 exercises.append({
                     "id": res.get("id"),
                     "name": res.get("description"),
                     "status": res.get("status"),
                     "execution_period": res.get("executionPeriod"),
-                    "progress_notes": [note.get("text") for note in res.get("note", [])],
+                    "progress_percentage": progress_percentage,
+                    "duration_days": duration_days,
+                    "progress_notes": progress_notes,
                 })
 
         return {"success": True, "in_progress_exercises": exercises}
+
     except Exception as e:
         return {"success": False, "in_progress_exercises": [], "error": str(e)}
-
     
 @app.delete("/rehab/exercises", response_model=dict)
 def delete_exercise(uhid: str, exercise_name: str):

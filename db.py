@@ -276,7 +276,17 @@ def fhir_medication_resources(uhid: str, tablet_prescribed: TabletPrescribed) ->
             "medicationCodeableConcept": {"text": t.tablet_name},
             "dosageInstruction": [
                 {
-                    "text": f"{t.dosage}, Schedule: {t.schedule_pattern}, {'before food' if t.before_food else 'after food'}"
+                    "text": f"{t.dosage}, Schedule: {t.schedule_pattern}, {'before food' if t.before_food else 'after food'}",
+                    "timing": {
+                        "repeat": {
+                            "boundsDuration": {
+                                "value": t.duration_days,
+                                "unit": "days",
+                                "system": "http://unitsofmeasure.org",
+                                "code": "d"
+                            }
+                        }
+                    }
                 }
             ],
             # store only doses_taken as JSON
@@ -326,11 +336,15 @@ def fhir_exercise_resources(uhid: str, rehab: RehabSection) -> dict:
                 "start": f"{ex.assigned_date}T{ex.assigned_time}",
                 "end": ex.completed_timestamp.isoformat() if ex.completed_timestamp else None
             },
-            "note": [{"text": f"Progress: {ex.progress_percentage}%"}],
+            # ✅ Include progress and duration_days
+            "note": [
+                {"text": f"Progress: {ex.progress_percentage}%"},
+                {"text": f"Duration Days: {ex.duration_days}"}
+            ],
             "meta": {"profile": [f"{FHIR_BASE_PROFILE}/Task"]}
         }
 
-        # ✅ Add exercise video if available
+        # Add exercise video if available
         if ex.exercise_video:
             task["input"] = [
                 {
@@ -342,6 +356,7 @@ def fhir_exercise_resources(uhid: str, rehab: RehabSection) -> dict:
         entries.append({"resource": task, "request": {"method": "POST", "url": "Task"}})
 
     return {"resourceType": "Bundle", "type": "transaction", "entry": entries}
+
 
 
 def fhir_instruction_resources(uhid: str, rehab: RehabSection) -> dict:
