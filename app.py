@@ -1074,6 +1074,7 @@ def get_in_progress_exercises(uhid: str):
     """Fetch all in-progress exercises for a patient by UHID."""
     headers = get_headers()
     exercises = []
+
     try:
         response = requests.get(
             f"{FHIR_URL}/Task",
@@ -1088,27 +1089,44 @@ def get_in_progress_exercises(uhid: str):
             }
 
         data = response.json()
+
         for entry in data.get("entry", []):
             res = entry.get("resource", {})
             if res.get("resourceType") == "Task" and res.get("status") == "in-progress":
                 
-                # Extract progress_percentage and duration_days from notes
+                # ✅ Extract exercise video URL (same as in /rehab/exercises)
+                video_url = None
+                for inp in res.get("input", []):
+                    if inp.get("valueUrl"):
+                        video_url = inp["valueUrl"]
+
+                # ✅ Extract progress_percentage and duration_days from notes
                 progress_percentage = None
                 duration_days = None
                 progress_notes = []
+
                 for note in res.get("note", []):
                     text = note.get("text")
+                    if not text:
+                        continue
+
                     progress_notes.append(text)
-                    if text and "Progress:" in text:
+
+                    if text.startswith("Progress:"):
                         try:
-                            progress_percentage = float(text.split("Progress:")[1].replace("%", "").strip())
-                        except:
-                            pass
-                    if text and "Duration Days:" in text:
+                            progress_percentage = float(
+                                text.split("Progress:")[1].replace("%", "").strip()
+                            )
+                        except ValueError:
+                            progress_percentage = None
+
+                    elif text.startswith("Duration Days:"):
                         try:
-                            duration_days = int(text.split("Duration Days:")[1].strip())
-                        except:
-                            pass
+                            duration_days = int(
+                                text.split("Duration Days:")[1].strip()
+                            )
+                        except ValueError:
+                            duration_days = None
 
                 exercises.append({
                     "id": res.get("id"),
@@ -1117,13 +1135,19 @@ def get_in_progress_exercises(uhid: str):
                     "execution_period": res.get("executionPeriod"),
                     "progress_percentage": progress_percentage,
                     "duration_days": duration_days,
+                    "exercise_video": video_url,  # ✅ Added here
                     "progress_notes": progress_notes,
                 })
 
         return {"success": True, "in_progress_exercises": exercises}
 
     except Exception as e:
-        return {"success": False, "in_progress_exercises": [], "error": str(e)}
+        return {
+            "success": False,
+            "in_progress_exercises": [],
+            "error": str(e)
+        }
+
     
 @app.delete("/rehab/exercises", response_model=dict)
 def delete_exercise(uhid: str, exercise_name: str):
