@@ -1,7 +1,7 @@
 from datetime import date, datetime, timedelta
 import hashlib
 import hmac
-from typing import List, Optional
+from typing import Dict, List, Optiona
 from fastapi import  BackgroundTasks, Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, BackgroundTasks, Query, Form, File, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +10,8 @@ import razorpay
 import requests
 from azure.identity import ClientSecretCredential
 from models import (
+    ConsentFormData,
+    ConsentFormStatus,
     DocumentEntry,
     DosePeriod,
     ExerciseEntry,
@@ -17,7 +19,6 @@ from models import (
     PaymentRequest,
     RehabInstructions,
     SurgeryDetails,
-    ConsentForm,
     PreOpChecklist,
     SlotBooking,
     BillingInfo,
@@ -29,8 +30,9 @@ from models import (
     TodaysMeal
 )
 from apscheduler.schedulers.background import BackgroundScheduler
-from db import fhir_patient_resource,fhir_surgery_resources,fhir_consent_resource,fhir_preop_checklist_resources,fhir_slot_booking_resource,fhir_billing_resource,fhir_watchdata_resources,fhir_meal_resources,fhir_medication_resources
+from db import fhir_consent_form_status_resources, fhir_consent_resource_structured, fhir_patient_resource,fhir_surgery_resources,fhir_preop_checklist_resources,fhir_slot_booking_resource,fhir_billing_resource,fhir_watchdata_resources,fhir_meal_resources,fhir_medication_resources
 from azure.storage.blob import BlobServiceClient
+
 
 # Get environment variables
 FHIR_URL = os.getenv("FHIR_URL")
@@ -143,49 +145,157 @@ def get_procedures_by_uhid(uhid: str):
 
 
 # ---------------------- CONSENT FORM ----------------------
-@app.post("/fhir/consent-forms", response_model=dict)
-async def convert_consent(uhid: str, consent: ConsentForm):
-    """Convert consent form to FHIR Consent resource."""
-    return fhir_consent_resource(uhid, consent)
-
-@app.post("/fhir/consent-form")
-def convert_consent(uhid: str, consent: ConsentForm):
-    """Convert ConsentForm and post to Azure FHIR."""
-    consent_resource = fhir_consent_resource(uhid, consent)
+@app.post("/fhir/consent-form-status", response_model=Dict)
+async def post_consent_status(uhid: str, consent: ConsentFormStatus):
+    """Convert ConsentFormStatus to FHIR Consent and post to Azure FHIR."""
+    bundle = fhir_consent_form_status_resources(uhid, consent)
     headers = get_headers()
 
     try:
-        response = requests.post(f"{FHIR_URL}/", json=fhir_consent_resource(uhid, consent), headers=headers)
-        if response.status_code < 400:
-            return {"success": True, "message": "Consent resource posted successfully."}
-        else:
-            return {"success": False, "message": f"FHIR server returned error: {response.status_code} {response.text}"}
+        for entry in bundle["entry"]:
+            resource = entry["resource"]
+            response = requests.post(f"{FHIR_URL}/Consent", json=resource, headers=headers)
+            if response.status_code >= 400:
+                return {
+                    "success": False,
+                    "message": f"FHIR server error: {response.status_code} {response.text}"
+                }
+
+        return {"success": True, "message": "Consent form status posted successfully."}
+
+    except Exception as e:
+        return {"success": False, "message": f"Error posting to FHIR server: {str(e)}"}
+
+@app.get("/fhir/consent-form-status/{uhid}", response_model=Dict)
+async def get_consent_form_status(uhid: str):
+    """
+    Fetch ConsentFormStatus (FHIR Consent resource with internal tag)
+    for a given UHID and return only the resource body.
+    """
+    headers = get_headers()
+
+    try:
+        # 1️⃣ Search by UHID only
+        url = f"{FHIR_URL}/Consent?identifier=https://hospital.com/uhid|{uhid}"
+        response = requests.get(url, headers=headers)
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"FHIR server returned error: {response.text}"
+            )
+
+        data = response.json()
+        entries = data.get("entry", [])
+
+        if not entries:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No Consent found for UHID {uhid}"
+            )
+
+        # 2️⃣ Filter manually for internal ConsentFormStatus tag
+        consent_form_status_entries = [
+            entry["resource"]
+            for entry in entries
+            if "resource" in entry and
+               any(tag.get("code") == "ConsentFormStatus"
+                   for tag in entry["resource"].get("meta", {}).get("tag", []))
+        ]
+
+        if not consent_form_status_entries:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No ConsentFormStatus found for UHID {uhid}"
+            )
+
+        # 3️⃣ Return the latest one by dateTime
+        latest = max(
+            consent_form_status_entries,
+            key=lambda r: r.get("dateTime", "")
+        )
+
+        return {"success": True, "data": latest}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@app.post("/fhir/consent-forms", response_model=Dict)
+async def post_consent_structured(uhid: str, consent: ConsentFormData):
+    """Convert structured ConsentFormData to FHIR Consent Bundle and post to Azure FHIR."""
+    bundle = fhir_consent_resource_structured(uhid, consent)
+    headers = get_headers()
+
+    try:
+        for entry in bundle["entry"]:
+            resource = entry["resource"]
+            response = requests.post(f"{FHIR_URL}/Consent", json=resource, headers=headers)
+            if response.status_code >= 400:
+                return {
+                    "success": False,
+                    "message": f"FHIR server error: {response.status_code} {response.text}"
+                }
+
+        return {"success": True, "message": "Structured consent form posted successfully."}
+
     except Exception as e:
         return {"success": False, "message": f"Error posting to FHIR server: {str(e)}"}
     
-@app.get("/fhir/consent-form/{uhid}")
-def get_consents_by_uhid(uhid: str):
+@app.get("/fhir/consent-form/{uhid}", response_model=Dict)
+async def get_consent_form_status(uhid: str):
     """
-    Get all Consent resources for a Patient identified by UHID.
+    Fetch ConsentFormStatus (FHIR Consent resource with internal tag)
+    for a given UHID and return only the resource body.
     """
     headers = get_headers()
 
     try:
-        # Query Consent resources where patient reference = Patient/{uhid}
-        consent_url = f"{FHIR_URL}/Consent?patient=Patient/{uhid}"
-        response = requests.get(consent_url, headers=headers)
+        # 1️⃣ Search by UHID only
+        url = f"{FHIR_URL}/Consent?identifier=https://hospital.com/uhid|{uhid}"
+        response = requests.get(url, headers=headers)
 
-        if response.status_code >= 400:
-            return {"success": False, "message": f"FHIR server error: {response.text}"}
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"FHIR server returned error: {response.text}"
+            )
 
         data = response.json()
-        if not data.get("entry"):
-            return {"success": False, "message": f"No Consent resources found for UHID {uhid}"}
+        entries = data.get("entry", [])
 
-        return {"success": True, "consents": data}
+        if not entries:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No Consent found for UHID {uhid}"
+            )
+
+        # 2️⃣ Filter manually for internal ConsentFormStatus tag
+        consent_form_status_entries = [
+            entry["resource"]
+            for entry in entries
+            if "resource" in entry and
+               any(tag.get("code") == "ConsentFormData"
+                   for tag in entry["resource"].get("meta", {}).get("tag", []))
+        ]
+
+        if not consent_form_status_entries:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No ConsentFormStatus found for UHID {uhid}"
+            )
+
+        # 3️⃣ Return the latest one by dateTime
+        latest = max(
+            consent_form_status_entries,
+            key=lambda r: r.get("dateTime", "")
+        )
+
+        return {"success": True, "data": latest}
 
     except Exception as e:
-        return {"success": False, "message": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ---------------------- PRE-OP CHECKLIST ----------------------
 @app.post("/fhir/preop-checklist", response_model=dict)

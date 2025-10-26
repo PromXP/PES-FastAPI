@@ -18,17 +18,83 @@ class SurgeryDetails(BaseModel):
 
 
 # ------------------ Consent Form ------------------
+class BasicDetails(BaseModel):
+    first_name: str
+    last_name: str
+    date_of_birth: date
+    hospital_registration_number: str
+    responsible_attender_name: Optional[str] = None
+    requirements: Optional[str] = None  # Interpreter, guardian, etc.
+
+class SurgeryDetailsSection(BaseModel):
+    indication: str
+    extra_procedures: Optional[str] = None
+    site_and_side: Optional[str] = None
+    alternatives_considered: Optional[str] = None
+
+class RiskItem(BaseModel):
+    risk_name: str
+    description: str
+    likelihood: str  # Expected / Common / Uncommon / Rare
+    factors_increasing_risk: Optional[str] = None
+
+class PatientSpecificRisks(BaseModel):
+    patient_specific_risks: Optional[str] = None
+
+class PatientSpecificConcerns(BaseModel):
+    blood_transfusion: Optional[str] = None
+    other_procedures: Optional[str] = None
+
+class HealthProfessionalStatement(BaseModel):
+    name: str
+    date: date
+    job_title: str
+    signature: Optional[str] = None
+    patient_information_leaflet_provided: Optional[bool] = None
+    patient_information_leaflet_provided_details: Optional[str] = None
+    copy_accepted_by_patient: Optional[bool] = None
+
+
+class PatientStatement(BaseModel):
+    interpreter_or_witness_name: Optional[str] = None
+    interpreter_or_witness_signature: Optional[str] = None
+    information_interpreted: bool
+
+class AdditionalConsent(BaseModel):
+    allows_education_research_use: bool
+    allows_research_access_to_records: bool
+    pregnant_risk_confirmed: Optional[bool] = None
+    additional_name: str
+    addittional_date: str
+    caretaker_name: Optional[str] = None
+    relationship_to_patient: Optional[str] = None
+    reason_for_surrogate_consent: Optional[str] = None
+
+
+class ConsentFormData(BaseModel):
+    basic_details: BasicDetails
+    surgery_details: SurgeryDetailsSection
+    risks: List[RiskItem] = Field(default_factory=list)
+    patient_specific_risks: Optional[PatientSpecificRisks] = None
+    patient_specific_concerns: Optional[PatientSpecificConcerns] = None
+    health_professional_statement: Optional[HealthProfessionalStatement] = None
+    patient_statement: Optional[PatientStatement] = None
+    additional_consent: Optional[AdditionalConsent] = None
+
+
+class ConsentFormStatus(BaseModel):
+    status: Literal[0, 1]  # 0=draft, 1=active, 2=rejected
+    status_timestamp: datetime  # When T&C was accepted
+    approval: Literal[0, 1, 2]  # consent approval lifecycle
+    approval_timestamp: datetime
+    validation: Literal[0, 1, 2]  # 1=permit, 0/2=deny
+    validation_timestamp: datetime
+    document_url: Optional[str] = None
+    document_creation: datetime
+
 class ConsentForm(BaseModel):
-    filled_data: Dict[str, str] = Field(default_factory=dict)
-    editable_fields: Dict[str, str] = Field(default_factory=dict)
-    terms_and_conditions: Literal[0, 1]
-    terms_and_conditions: datetime
-    consent_form_approval: Literal[0, 1, 2]
-    consent_form_approval_timestamp: datetime
-    consent_form_upload_link: Optional[str] = None
-    consent_form_upload_link_timestamp: datetime
-    consent_form_validation: Literal[0, 1, 2]
-    consent_form_validation_timestamp: datetime
+    form_data: ConsentFormData
+    status: ConsentFormStatus
 
 
 # ------------------ Pre-Op Checklist ------------------
@@ -180,12 +246,60 @@ class PatientFullModel(BaseModel):
                     }
                 ],
                 "consent_form": {
-                    "filled_data": {"patient_name": "John Doe", "age": "45"},
-                    "editable_fields": {"guardian_name": "Jane Doe"},
-                    "terms_and_conditions": 1,
-                    "consent_form_approval": 1,
-                    "consent_form_upload_link": "https://hospital.com/uploads/consent/UHID123456.pdf",
-                    "consent_form_validation": 1
+                    "form_data": {
+                        "basic_details": {
+                        "first_name": "John",
+                        "last_name": "Doe",
+                        "date_of_birth": "1979-03-15",
+                        "hospital_registration_number": "UHID123456",
+                        "responsible_attender_name": "Jane Doe",
+                        "requirements": "Interpreter"
+                        },
+                        "surgery_details": {
+                        "procedure": "Total Knee Replacement",
+                        "indication": "Osteoarthritis of the knee – to reduce pain and improve mobility",
+                        "site_and_side": "Left"
+                        },
+                        "risks": [
+                        {
+                            "risk_name": "Bleeding and Haematoma",
+                            "description": "Some bleeding is expected during the procedure...",
+                            "likelihood": "Common"
+                        }
+                        ],
+                        "patient_specific_risks": {
+                        "concerns": "Allergy to latex",
+                        "extra_procedures_if_necessary": "Blood transfusion if required"
+                        },
+                        "health_professional_statement": {
+                        "name": "Dr. Vetri M K",
+                        "date": "2025-10-26",
+                        "job_title": "Consultant Surgeon"
+                        },
+                        "patient_statement": {
+                        "understands_form": 1,
+                        "agrees_treatment": 1,
+                        "aware_of_alternatives": 1,
+                        "understands_risks": 1,
+                        "discussed_anaesthesia": 1,
+                        "agrees_additional_procedures_if_necessary": 1,
+                        "allows_data_collection": 1
+                        },
+                        "additional_consent": {
+                        "allows_education_research_use": 1,
+                        "allows_research_access_to_records": 1
+                        }
+                    },
+                    "status": {
+                        "terms_and_conditions": 1,
+                        "terms_and_conditions_timestamp": "2025-10-26T09:30:00Z",
+                        "consent_form_approval": 1,
+                        "consent_form_approval_timestamp": "2025-10-26T09:35:00Z",
+                        "consent_form_upload_link": "https://hospital.com/uploads/consent/UHID123456.pdf",
+                        "consent_form_upload_link_timestamp": "2025-10-26T09:40:00Z",
+                        "consent_form_validation": 1,
+                        "consent_form_validation_timestamp": "2025-10-26T09:45:00Z"
+                    }
                 },
                 "pre_op_checklist": {
                     "documents": [

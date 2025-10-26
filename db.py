@@ -1,10 +1,12 @@
-from typing import List
+import base64
+from typing import Any, Dict, List
 from datetime import datetime
 from models import (
+    ConsentFormData,
+    ConsentFormStatus,
     PatientFullModel,
     PatientLogin,
     SurgeryDetails,
-    ConsentForm,
     PreOpChecklist,
     SlotBooking,
     BillingInfo,
@@ -102,40 +104,225 @@ def fhir_surgery_resources(uhid: str, surgeries: List[SurgeryDetails]) -> dict:
         "entry": entries
     }
 
-# ------------------ 3️⃣ Consent ------------------
-def fhir_consent_resource(uhid: str, consent: ConsentForm) -> dict:
-    """Convert full ConsentForm details into a FHIR R4 Consent resource with all fields included."""
-    
+# ------------------ 3️⃣ Consent form ------------------
+def fhir_consent_resource_structured(uhid: str, consent: "ConsentFormData") -> Dict[str, Any]:
+    """Convert ConsentFormData into a FHIR-valid Consent Bundle using structured codes for every field."""
+
+    # --- BasicDetails mapping ---
+    bd = consent.basic_details
+    basic_details_codes = [
+        {"coding": [{"system": "http://hospital.com/patient", "code": "first-name", "display": bd.first_name}]},
+        {"coding": [{"system": "http://hospital.com/patient", "code": "last-name", "display": bd.last_name}]},
+        {"coding": [{"system": "http://hospital.com/patient", "code": "date-of-birth", "display": bd.date_of_birth.isoformat()}]},
+        {"coding": [{"system": "http://hospital.com/patient", "code": "hospital-registration-number", "display": bd.hospital_registration_number}]}
+    ]
+    if bd.responsible_attender_name:
+        basic_details_codes.append({"coding": [{"system": "http://hospital.com/patient", "code": "responsible-attender", "display": bd.responsible_attender_name}]})
+    if bd.requirements:
+        basic_details_codes.append({"coding": [{"system": "http://hospital.com/patient", "code": "requirements", "display": bd.requirements}]})
+
+
+    # --- SurgeryDetails mapping ---
+    sd = consent.surgery_details
+    surgery_codes = [
+        {"coding": [{"system": "http://hospital.com/surgery", "code": "indication", "display": sd.indication}]}
+    ]
+    if sd.extra_procedures:
+        surgery_codes.append({"coding": [{"system": "http://hospital.com/surgery", "code": "extra-procedures", "display": sd.extra_procedures}]})
+    if sd.site_and_side:
+        surgery_codes.append({"coding": [{"system": "http://hospital.com/surgery", "code": "site-and-side", "display": sd.site_and_side}]})
+    if sd.alternatives_considered:
+        surgery_codes.append({"coding": [{"system": "http://hospital.com/surgery", "code": "alternatives-considered", "display": sd.alternatives_considered}]})
+
+
+    # --- Risks mapping ---
+    risk_codings = []
+    for r in consent.risks:
+        risk_codings.append({
+            "coding": [{"system": "http://hospital.com/risks", "code": r.risk_name.lower().replace(" ", "-"), "display": r.description}],
+            "text": r.factors_increasing_risk or ""
+        })
+
+
+    # --- Patient Specific Risks/Concerns mapping ---
+    patient_risks_codes = []
+    if consent.patient_specific_risks and consent.patient_specific_risks.patient_specific_risks:
+        patient_risks_codes.append({
+            "coding": [{"system": "http://hospital.com/patient-specific-risks", "code": "patient-specific-risks", "display": consent.patient_specific_risks.patient_specific_risks}]
+        })
+    patient_concerns_codes = []
+    if consent.patient_specific_concerns:
+        if consent.patient_specific_concerns.blood_transfusion:
+            patient_concerns_codes.append({"coding": [{"system": "http://hospital.com/patient-specific-concerns", "code": "blood-transfusion", "display": consent.patient_specific_concerns.blood_transfusion}]})
+        if consent.patient_specific_concerns.other_procedures:
+            patient_concerns_codes.append({"coding": [{"system": "http://hospital.com/patient-specific-concerns", "code": "other-procedures", "display": consent.patient_specific_concerns.other_procedures}]})
+
+
+    # --- Additional Consent mapping ---
+    additional_codes = []
+    if consent.additional_consent:
+        ac = consent.additional_consent
+        additional_codes.extend([
+            {"coding": [{"system": "http://hospital.com/additional-consent", "code": "allows-education-research-use", "display": str(ac.allows_education_research_use)}]},
+            {"coding": [{"system": "http://hospital.com/additional-consent", "code": "allows-research-access-to-records", "display": str(ac.allows_research_access_to_records)}]}
+        ])
+        if ac.pregnant_risk_confirmed is not None:
+            additional_codes.append({"coding": [{"system": "http://hospital.com/additional-consent", "code": "pregnant-risk-confirmed", "display": str(ac.pregnant_risk_confirmed)}]})
+        additional_codes.append({"coding": [{"system": "http://hospital.com/additional-consent", "code": "additional-name", "display": ac.additional_name}]})
+        additional_codes.append({"coding": [{"system": "http://hospital.com/additional-consent", "code": "additional-date", "display": ac.addittional_date}]})
+        if ac.caretaker_name:
+            additional_codes.append({"coding": [{"system": "http://hospital.com/additional-consent", "code": "caretaker-name", "display": ac.caretaker_name}]})
+        if ac.relationship_to_patient:
+            additional_codes.append({"coding": [{"system": "http://hospital.com/additional-consent", "code": "relationship-to-patient", "display": ac.relationship_to_patient}]})
+        if ac.reason_for_surrogate_consent:
+            additional_codes.append({"coding": [{"system": "http://hospital.com/additional-consent", "code": "reason-for-surrogate-consent", "display": ac.reason_for_surrogate_consent}]})
+
+
+    # --- Combine all codes into provision_codes ---
+    provision_codes = basic_details_codes + surgery_codes + patient_risks_codes + patient_concerns_codes + risk_codings + additional_codes
+
+    # --- Health Professional Statement mapping (all fields) ---
+    verification_entries = []
+    if consent.health_professional_statement:
+        hps = consent.health_professional_statement
+        verification_entries.append({
+            "verified": True,
+            "verifiedWith": {"display": hps.name},
+            "verificationDate": hps.date.isoformat() if hps.date else None
+        })
+        provision_codes.extend([
+            {"coding": [{"system": "http://hospital.com/health-professional", "code": "job-title", "display": hps.job_title}]}
+        ])
+        if hps.signature:
+            provision_codes.append({"coding": [{"system": "http://hospital.com/health-professional", "code": "signature", "display": hps.signature}]})
+        if hps.patient_information_leaflet_provided is not None:
+            provision_codes.append({"coding": [{"system": "http://hospital.com/health-professional", "code": "patient-info-leaflet-provided", "display": str(hps.patient_information_leaflet_provided)}]})
+        if hps.patient_information_leaflet_provided_details:
+            provision_codes.append({"coding": [{"system": "http://hospital.com/health-professional", "code": "patient-info-leaflet-details", "display": hps.patient_information_leaflet_provided_details}]})
+        if hps.copy_accepted_by_patient is not None:
+            provision_codes.append({"coding": [{"system": "http://hospital.com/health-professional", "code": "copy-accepted-by-patient", "display": str(hps.copy_accepted_by_patient)}]})
+
+    # --- Patient Statement mapping (all fields) ---
+    if consent.patient_statement:
+        ps = consent.patient_statement
+        verification_entries.append({
+            "verified": True,
+            "verifiedWith": {"display": ps.interpreter_or_witness_name or "Patient/Interpreter"}
+        })
+        provision_codes.extend([
+            {"coding": [{"system": "http://hospital.com/patient-statement", "code": "interpreter-or-witness-name", "display": ps.interpreter_or_witness_name or ""}]}
+        ])
+        if ps.interpreter_or_witness_signature:
+            provision_codes.append({"coding": [{"system": "http://hospital.com/patient-statement", "code": "interpreter-or-witness-signature", "display": ps.interpreter_or_witness_signature}]})
+        provision_codes.append({"coding": [{"system": "http://hospital.com/patient-statement", "code": "information-interpreted", "display": str(ps.information_interpreted)}]})
+
+
+    # --- Construct Consent resource ---
     consent_resource = {
         "resourceType": "Consent",
         "identifier": [{"system": "https://hospital.com/uhid", "value": uhid}],
-        "status": "active" if consent.consent_form_approval == 1 else "inactive",
+        "status": "active",
+        "scope": {
+            "coding": [{"system": "http://terminology.hl7.org/CodeSystem/consentscope", "code": "treatment", "display": "Treatment"}]
+        },
+        "category": [{"coding": [{"system": "http://loinc.org", "code": "57016-8", "display": "Consent for surgical procedure"}]}],
+        "patient": {"reference": f"Patient/{uhid}"},
+        "policy": [],
+        "verification": verification_entries,
+        "provision": {
+            "type": "permit",
+            "actor": [{"role": {"text": "Patient"}, "reference": {"reference": f"Patient/{uhid}"}}],
+            "code": provision_codes
+        },
+        "meta": {
+        "profile": [f"{FHIR_BASE_PROFILE}/Consent"],
+        "tag": [
+            {
+                "system": "https://hospital.com/internal",
+                "code": "ConsentFormData",
+                "display": "Internal ConsentFormData resource"
+            }
+        ]
+    }
+    }
+
+    return {
+        "resourceType": "Bundle",
+        "type": "transaction",
+        "entry": [{"resource": consent_resource, "request": {"method": "POST", "url": "Consent"}}]
+    }
+
+# ------------------ 3️⃣ Consent form status ------------------
+def fhir_consent_form_status_resources(
+    uhid: str, consent_status: ConsentFormStatus
+) -> Dict:
+    """Create a clean FHIR R4 Bundle for ConsentFormStatus using all fields, no practitioner."""
+
+    status_map = {0: "draft", 1: "active"}
+    approval_map = {0: "draft", 1: "active", 2: "rejected"}
+
+    consent_resource = {
+        "resourceType": "Consent",
+        "identifier": [{"system": "https://hospital.com/uhid", "value": uhid}],
+        "status": status_map.get(consent_status.status, "draft"),
         "scope": {
             "coding": [{
                 "system": "http://terminology.hl7.org/CodeSystem/consentscope",
-                "code": "patient-privacy"
+                "code": "treatment",
+                "display": "Treatment"
             }]
         },
-        "category": [{"text": "Surgical Consent"}],
+        "category": [{
+            "coding": [{
+                "system": "http://loinc.org",
+                "code": "57016-8",
+                "display": "Consent for surgical procedure"
+            }]
+        }],
         "patient": {"reference": f"Patient/{uhid}"},
-        "dateTime": consent.consent_form_approval_timestamp.isoformat(),
-        "policyRule": {"text": "Hospital Terms & Conditions"},
-        "sourceAttachment": {"url": consent.consent_form_upload_link},
-        # Flatten filled_data and editable_fields as separate properties
-        "filledData": consent.filled_data or {},
-        "editableFields": consent.editable_fields or {},
-        # Include all other consent fields as individual values
-        "termsAndConditions": consent.terms_and_conditions,
-        "termsAndConditionsTimestamp": consent.terms_and_conditions_timestamp.isoformat(),
-        "consentFormApproval": consent.consent_form_approval,
-        "consentFormApprovalTimestamp": consent.consent_form_approval_timestamp.isoformat(),
-        "consentFormUploadLink": consent.consent_form_upload_link,
-        "consentFormUploadLinkTimestamp": consent.consent_form_upload_link_timestamp.isoformat(),
-        "consentFormValidation": consent.consent_form_validation,
-        "consentFormValidationTimestamp": consent.consent_form_validation_timestamp.isoformat()
+        "dateTime": consent_status.status_timestamp.isoformat(),
+        "policy": [
+            {"authority": "https://ndhm.gov.in", "uri": "https://ndhm.gov.in/consent"},
+            {"authority": "https://hhs.gov/hipaa", "uri": "https://hhs.gov/hipaa/consent"}
+        ],
+        "sourceAttachment": {
+            "contentType": "application/pdf",
+            "url": consent_status.document_url,
+            "title": "Signed Consent Form",
+            "creation": consent_status.document_creation.isoformat()
+        },
+        "provision": {
+            "type": "permit" if consent_status.validation == 1 else "deny",
+            "period": {
+                "start": consent_status.approval_timestamp.isoformat(),
+                "end": consent_status.validation_timestamp.isoformat()
+            },
+            "actor": [
+                {"role": {"text": f"Patient (Approval: {approval_map.get(consent_status.approval, 'draft')})"},
+                 "reference": {"reference": f"Patient/{uhid}"}}
+            ]
+        },
+        # Add a tag to indicate this is your internal ConsentFormStatus
+        "meta": {
+            "profile": [f"{FHIR_BASE_PROFILE}/Consent"],
+            "tag": [
+                {
+                    "system": "https://hospital.com/internal",
+                    "code": "ConsentFormStatus",
+                    "display": "Internal ConsentFormStatus resource"
+                }
+            ]
+        }
     }
 
-    return consent_resource
+    return {
+        "resourceType": "Bundle",
+        "type": "transaction",
+        "entry": [{"resource": consent_resource, "request": {"method": "POST", "url": "Consent"}}]
+    }
+
+
+
 
 
 # ------------------ 4️⃣ Pre-Op Checklist (DocumentReference) ------------------
