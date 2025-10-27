@@ -19,7 +19,7 @@ from models import (
     PaymentRequest,
     RehabInstructions,
     SurgeryDetails,
-    PreOpChecklist,
+    PreOpChecklist, 
     SlotBooking,
     BillingInfo,
     UpdateDoseRequest,
@@ -1346,7 +1346,7 @@ async def post_meals(uhid: str, meals: TodaysMeal):
 @app.get("/fhir/meals", response_model=dict)
 def get_meals(uhid: str):
     """
-    Fetch all NutritionOrder resources for a patient.
+    Fetch all NutritionOrder resources for a patient, including full meal details.
     """
     headers = get_headers()
     meals_list = []
@@ -1365,17 +1365,94 @@ def get_meals(uhid: str):
             if res.get("resourceType") == "NutritionOrder" and any(
                 identifier.get("value") == uhid for identifier in res.get("identifier", [])
             ):
-                meals_list.append({
+                # Extract identifiers
+                identifiers = {i["system"]: i["value"] for i in res.get("identifier", [])}
+
+                # Parse date/time
+                date_time = res.get("dateTime")
+                assigned_date = None
+                assigned_time = None
+                completed_timestamp = None
+
+                # Extract note fields
+                notes = res.get("note", [])
+                for note in notes:
+                    text = note.get("text", "")
+                    if text.startswith("Assigned date:"):
+                        assigned_date = text.replace("Assigned date:", "").strip()
+                    elif text.startswith("Assigned time:"):
+                        assigned_time = text.replace("Assigned time:", "").strip()
+                    elif text.startswith("Completed at"):
+                        completed_timestamp = text.replace("Completed at", "").strip()
+
+                # Build full meal object
+                meal_obj = {
                     "id": res.get("id"),
+                    "meal_name": identifiers.get("https://hospital.com/meal-id"),
                     "period": res.get("oralDiet", {}).get("type", [{}])[0].get("text"),
                     "description": res.get("oralDiet", {}).get("instruction"),
-                    "dateTime": res.get("dateTime")
-                })
+                    "status": res.get("status"),
+                    "intent": res.get("intent"),
+                    "assigned_date": assigned_date,
+                    "assigned_time": assigned_time,
+                    "completed_timestamp": completed_timestamp,
+                    "dateTime": date_time,
+                }
+
+                meals_list.append(meal_obj)
 
         return {"success": True, "meals": meals_list}
 
     except Exception as e:
         return {"success": False, "meals": [], "error": str(e)}
+
+    
+@app.delete("/fhir/meals", response_model=dict)
+def delete_meal(uhid: str, meal_name: str):
+    """
+    Delete a NutritionOrder by UHID and Meal Name.
+    Looks up the NutritionOrder using identifiers and deletes it by its resource ID.
+    """
+    headers = get_headers()
+
+    try:
+        # Step 1: Search NutritionOrders for this patient
+        response = requests.get(
+            f"{FHIR_URL}/NutritionOrder",
+            headers=headers,
+            params={"subject": f"Patient/{uhid}", "_count": 1000}
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        target_id = None
+
+        # Step 2: Find NutritionOrder with the matching meal name
+        for entry in data.get("entry", []):
+            res = entry.get("resource", {})
+            if res.get("resourceType") == "NutritionOrder":
+                identifiers = {i["system"]: i["value"] for i in res.get("identifier", [])}
+                if (
+                    identifiers.get("https://hospital.com/uhid") == uhid
+                    and identifiers.get("https://hospital.com/meal-id") == meal_name
+                ):
+                    target_id = res.get("id")
+                    break
+
+        if not target_id:
+            return {"success": False, "message": f"No meal found for UHID={uhid} and meal_name='{meal_name}'"}
+
+        # Step 3: Delete the specific NutritionOrder by ID
+        delete_resp = requests.delete(f"{FHIR_URL}/NutritionOrder/{target_id}", headers=headers)
+        delete_resp.raise_for_status()
+
+        return {"success": True, "message": f"Meal '{meal_name}' for UHID={uhid} deleted successfully"}
+
+    except requests.exceptions.HTTPError as e:
+        return {"success": False, "message": f"Failed to delete: {e.response.text}"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
 
 # -------------------- CREATE ORDER --------------------
 @app.post("/create-order")

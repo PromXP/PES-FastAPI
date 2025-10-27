@@ -570,20 +570,51 @@ def fhir_instruction_resources(uhid: str, rehab: RehabSection) -> dict:
 
 # ------------------ 🔟 Today's Meal (NutritionOrder) ------------------
 def fhir_meal_resources(uhid: str, meals: TodaysMeal) -> dict:
-    """FHIR R4 NutritionOrder inside a transaction Bundle"""
+    """Create a FHIR R4 NutritionOrder Bundle representing all meals for a patient."""
     entries = []
+
     for m in meals.meals:
         nutrition = {
             "resourceType": "NutritionOrder",
-            "identifier": [{"system": "https://hospital.com/uhid", "value": uhid}],
-            "status": "active",
-            "intent": "order",  # Required field
+            "identifier": [
+                {"system": "https://hospital.com/uhid", "value": uhid},
+                {"system": "https://hospital.com/meal-id", "value": m.meal_name},
+            ],
+            "status": "completed" if m.completed_timestamp else "active",
+            "intent": "order",
             "patient": {"reference": f"Patient/{uhid}"},
             "dateTime": f"{m.assigned_date}T{m.assigned_time}",
-            "oralDiet": {"type": [{"text": m.period}], "instruction": m.description},
-            "meta": {"profile": [f"{FHIR_BASE_PROFILE}/NutritionOrder"]}
+            "oralDiet": {
+                "type": [{"text": m.period}],
+                "instruction": m.description,
+            },
+            "note": [
+                {"text": f"Meal: {m.meal_name}"},
+                {"text": f"Assigned date: {m.assigned_date}"},
+                {"text": f"Assigned time: {m.assigned_time}"},
+            ],
+            "meta": {
+                "profile": [f"{FHIR_BASE_PROFILE}/NutritionOrder"]
+            },
         }
-        entries.append({"resource": nutrition, "request": {"method": "POST", "url": "NutritionOrder"}})
 
-    return {"resourceType": "Bundle", "type": "transaction", "entry": entries}
+        # ✅ Add completion info only if available
+        if m.completed_timestamp is not None:
+            nutrition["note"].append(
+                {"text": f"Completed at {m.completed_timestamp.isoformat()}"}
+            )
+
+        entries.append({
+            "resource": nutrition,
+            "request": {
+                "method": "POST",
+                "url": "NutritionOrder"
+            },
+        })
+
+    return {
+        "resourceType": "Bundle",
+        "type": "transaction",
+        "entry": entries,
+    }
 

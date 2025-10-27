@@ -207,7 +207,7 @@ class MealEntry(BaseModel):
     period: Literal["breakfast", "lunch", "dinner", "snack"]
     assigned_date: date
     assigned_time: time
-    completed_timestamp: datetime
+    completed_timestamp: Optional[datetime] = None
 
 
 class TodaysMeal(BaseModel):
