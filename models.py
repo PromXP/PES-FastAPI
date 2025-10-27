@@ -84,13 +84,13 @@ class ConsentFormData(BaseModel):
 
 class ConsentFormStatus(BaseModel):
     status: Literal[0, 1]  # 0=draft, 1=active, 2=rejected
-    status_timestamp: datetime  # When T&C was accepted
+    status_timestamp: Optional[datetime] = None  # When T&C was accepted
     approval: Literal[0, 1, 2]  # consent approval lifecycle
-    approval_timestamp: datetime
+    approval_timestamp: Optional[datetime] = None
     validation: Literal[0, 1, 2]  # 1=permit, 0/2=deny
-    validation_timestamp: datetime
+    validation_timestamp: Optional[datetime] = None
     document_url: Optional[str] = None
-    document_creation: datetime
+    document_creation: Optional[datetime] = None
 
 class ConsentForm(BaseModel):
     form_data: ConsentFormData
