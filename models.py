@@ -100,13 +100,13 @@ class ConsentForm(BaseModel):
 # ------------------ Pre-Op Checklist ------------------
 class DocumentEntry(BaseModel):
     document_name: str
-    document_link: str
+    document_link: Optional[str] = None
     assigned_by: str
     assigned_timestamp: datetime
     validated_by: Optional[str] = None
     validation_timestamp: Optional[datetime] = None
-    updated_by: str
-    updated_timestamp: datetime
+    updated_by: Optional[str] = None
+    updated_timestamp: Optional[datetime] = None  # ✅ can be empty
 
 
 class PreOpChecklist(BaseModel):

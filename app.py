@@ -1,6 +1,7 @@
 from datetime import date, datetime, timedelta
 import hashlib
 import hmac
+import json
 from typing import Dict, List, Optional
 from fastapi import  BackgroundTasks, Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, BackgroundTasks, Query, Form, File, UploadFile
 from fastapi.encoders import jsonable_encoder
@@ -31,7 +32,7 @@ from models import (
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 from db import fhir_consent_form_status_resources, fhir_consent_resource_structured, fhir_patient_resource,fhir_surgery_resources,fhir_preop_checklist_resources,fhir_slot_booking_resource,fhir_billing_resource,fhir_watchdata_resources,fhir_meal_resources,fhir_medication_resources
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions, ContentSettings
 
 
 # Get environment variables
@@ -440,6 +441,104 @@ def delete_preop_document(uhid: str, document_name: str):
 
     except Exception as e:
         return {"success": False, "message": f"Error during deletion: {str(e)}"}
+    
+@app.put("/fhir/preop-checklist/update-document-but-delete-blob", response_model=dict)
+def update_preop_document_and_delete_from_azure(
+    uhid: str = Query(..., description="Patient UHID"),
+    document_name: str = Query(..., description="Document name"),
+    document_link: str = Query(..., description="Full Azure blob SAS URL")
+):
+    """
+    Updates an existing FHIR DocumentReference by clearing its attachment URL and custodian.display,
+    and deletes the corresponding file from Azure Blob Storage.
+    The FHIR resource itself is NOT deleted.
+    """
+
+    headers = get_headers()
+    params = {
+        "subject": f"Patient/{uhid}",
+        "type:text": document_name
+    }
+
+    try:
+        # Step 1️⃣: Search for the DocumentReference
+        search_resp = requests.get(f"{FHIR_URL}/DocumentReference", headers=headers, params=params)
+        if search_resp.status_code >= 400:
+            return {
+                "success": False,
+                "message": f"FHIR search error: {search_resp.status_code} {search_resp.text}"
+            }
+
+        data = search_resp.json()
+        entries = data.get("entry", [])
+        if not entries:
+            return {
+                "success": False,
+                "message": f"No FHIR document found for '{document_name}' and UHID '{uhid}'."
+            }
+
+        # Step 2️⃣: Delete from Azure storage using SAS URL
+        azure_deleted = False
+        try:
+            blob_client = blob_client.from_blob_url(document_link)
+            blob_client.delete_blob()
+            azure_deleted = True
+        except Exception as e:
+            print(f"⚠️ Azure deletion failed: {e}")
+
+        # Step 3️⃣: Update the DocumentReference
+        updated_docs = []
+        for entry in entries:
+            resource = entry.get("resource", {})
+            doc_id = resource.get("id")
+            if not doc_id:
+                continue
+
+            # Clear out attachment URL and custodian display
+            if "content" in resource and resource["content"]:
+                resource["content"][0]["attachment"]["url"] = None
+            if "custodian" in resource:
+                resource["custodian"]["display"] = None
+
+            # Update meta.lastUpdated
+            resource.setdefault("meta", {})
+            resource["meta"]["lastUpdated"] = datetime.utcnow().isoformat()
+
+            # Send PUT update to FHIR
+            update_resp = requests.put(
+                f"{FHIR_URL}/DocumentReference/{doc_id}",
+                headers=headers,
+                json=resource
+            )
+
+            if update_resp.status_code in (200, 201):
+                updated_docs.append({
+                    "document_id": doc_id,
+                    "document_name": document_name,
+                    "azure_deleted": azure_deleted
+                })
+            else:
+                print(f"⚠️ Failed to update FHIR DocumentReference {doc_id}: {update_resp.text}")
+
+        if not updated_docs:
+            return {
+                "success": False,
+                "message": "FHIR record found but update failed for all entries."
+            }
+
+        return {
+            "success": True,
+            "message": f"FHIR record updated and file deleted from Azure for '{document_name}'.",
+            "details": updated_docs
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            "success": False,
+            "message": f"Error during Azure deletion or FHIR update: {str(e)}",
+            "trace": traceback.format_exc()
+        }
 
 @app.put("/fhir/preop-checklist/update-single", response_model=dict)
 def update_single_document(uhid: str = Query(..., description="Patient UHID"),
@@ -499,6 +598,23 @@ def update_single_document(uhid: str = Query(..., description="Patient UHID"),
         "message": f"Document '{doc_entry.document_name}' updated successfully.",
         "document_id": doc_id
     }
+
+@app.get("/get-file-size")
+def get_file_size(file_url: str = Query(...)):
+    """
+    Fetch file size (in KB) from Azure Blob using SAS URL.
+    """
+    try:
+        response = requests.head(file_url)
+        if response.status_code != 200:
+            return {"success": False, "error": "Failed to fetch headers"}
+
+        size_bytes = int(response.headers.get("Content-Length", 0))
+        size_kb = round(size_bytes / 1024, 2)
+        return {"success": True, "size_kb": size_kb}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+        
 
 # ---------------------- SLOT BOOKING ----------------------
 @app.post("/fhir/slot-booking", response_model=dict)
@@ -744,16 +860,26 @@ def get_active_medications(uhid: str):
                 status = res.get("status", "unknown")
                 authored_on = res.get("authoredOn", "")
                 dosage = res.get("dosageInstruction", [{}])[0].get("text", "")
-                note_text = res.get("note", [{}])[0].get("text", "[]")
 
-                # ✅ Parse doses_taken JSON safely
-                import json
-                try:
-                    doses_taken = json.loads(note_text)
-                except Exception:
-                    doses_taken = [note_text]
+                # ✅ Collect doses from all notes as individual entries
+                notes = res.get("note", [])
+                doses_taken = []
+                for n in notes:
+                    text = n.get("text")
+                    if not text:
+                        continue
+                    text = text.strip()
+                    if text.startswith("[") and text.endswith("]"):
+                        try:
+                            parsed = json.loads(text)
+                            if isinstance(parsed, list):
+                                for item in parsed:
+                                    if isinstance(item, dict) and "day" in item:
+                                        doses_taken.append(item)
+                        except json.JSONDecodeError:
+                            pass
 
-                # ✅ Extract duration_days from dosageInstruction.repeat.boundsDuration
+                # ✅ Extract duration_days
                 duration_days = None
                 dosage_instr = res.get("dosageInstruction", [])
                 if dosage_instr:
@@ -772,7 +898,7 @@ def get_active_medications(uhid: str):
                     "doses_taken": doses_taken
                 })
 
-            # Handle pagination
+            # ✅ Pagination
             next_link = next(
                 (link.get("url") for link in data.get("link", []) if link.get("relation") == "next"),
                 None
@@ -866,7 +992,10 @@ def update_dose_taken(uhid: str, body: UpdateDoseRequest):
             resp = requests.get(url, headers=headers)
             data = resp.json()
             all_medications.extend(data.get("entry", []))
-            next_link = next((l.get("url") for l in data.get("link", []) if l.get("relation") == "next"), None)
+            next_link = next(
+                (l.get("url") for l in data.get("link", []) if l.get("relation") == "next"),
+                None,
+            )
             url = next_link
 
         updated_count = 0
@@ -876,10 +1005,10 @@ def update_dose_taken(uhid: str, body: UpdateDoseRequest):
             if res.get("medicationCodeableConcept", {}).get("text") != body.tablet_name:
                 continue
 
-            # Extract existing doses_taken from note.text if exists
             import json
             doses_taken = []
-            # Find note that contains doses_taken JSON
+
+            # Extract doses_taken JSON from notes (if any)
             for note in res.get("note", []):
                 try:
                     loaded = json.loads(note.get("text", "[]"))
@@ -887,29 +1016,36 @@ def update_dose_taken(uhid: str, body: UpdateDoseRequest):
                         doses_taken = loaded
                         break
                 except json.JSONDecodeError:
-                    continue  # skip other notes
+                    continue
 
-            # Update or append new dose
+            # Add or update dose entry
             exists = False
             for d in doses_taken:
                 if d["day"] == str(body.dose_day) and d["period"] == body.dose_period:
                     d["taken_timestamp"] = (
-                        body.taken_timestamp.isoformat() if body.taken_timestamp else datetime.now().isoformat()
+                        body.taken_timestamp.isoformat()
+                        if body.taken_timestamp
+                        else datetime.now().isoformat()
                     )
                     exists = True
                     break
+
             if not exists:
                 doses_taken.append({
                     "day": str(body.dose_day),
                     "period": body.dose_period,
-                    "taken_timestamp": body.taken_timestamp.isoformat() if body.taken_timestamp else datetime.now().isoformat()
+                    "taken_timestamp": (
+                        body.taken_timestamp.isoformat()
+                        if body.taken_timestamp
+                        else datetime.now().isoformat()
+                    ),
                 })
 
-            # Store doses_taken as JSON string in a new note entry (append)
+            # Append updated doses_taken as a new note
             updated_note_entry = {"text": json.dumps(doses_taken)}
             updated_notes = res.get("note", []) + [updated_note_entry]
 
-            # FHIR-compliant update payload
+            # ✅ Preserve authoredOn and other important fields
             update_payload = {
                 "resourceType": "MedicationRequest",
                 "id": res["id"],
@@ -918,19 +1054,33 @@ def update_dose_taken(uhid: str, body: UpdateDoseRequest):
                 "subject": res.get("subject"),
                 "medicationCodeableConcept": res.get("medicationCodeableConcept"),
                 "dosageInstruction": res.get("dosageInstruction", []),
-                "note": updated_notes
+                "authoredOn": res.get("authoredOn"),  # ✅ preserve authoredOn
+                "requester": res.get("requester"),    # ✅ preserve requester if any
+                "encounter": res.get("encounter"),    # optional but useful
+                "note": updated_notes,
             }
 
-            patch_resp = requests.put(f"{FHIR_URL}/MedicationRequest/{res['id']}", json=update_payload, headers=headers)
+            patch_resp = requests.put(
+                f"{FHIR_URL}/MedicationRequest/{res['id']}",
+                json=update_payload,
+                headers=headers,
+            )
             if patch_resp.status_code >= 400:
-                return {"success": False, "message": f"Failed to update {res['id']}: {patch_resp.text}"}
+                return {
+                    "success": False,
+                    "message": f"Failed to update {res['id']}: {patch_resp.text}",
+                }
 
             updated_count += 1
 
-        return {"success": True, "message": f"{updated_count} medication(s) updated for tablet '{body.tablet_name}'."}
+        return {
+            "success": True,
+            "message": f"{updated_count} medication(s) updated for tablet '{body.tablet_name}'.",
+        }
 
     except Exception as e:
         return {"success": False, "error": str(e)}
+
 
     
 def auto_complete_all_medications():
@@ -1503,6 +1653,67 @@ async def upload_image(file: UploadFile = File(...)):
 
         blob_url = f"{ACCOUNT_URL}{CONTAINER_NAME}/{blob_name}"
         return {"success": True, "blob_url": blob_url, "file_name": blob_name}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/upload-document", response_model=dict)
+async def upload_document(file: UploadFile = File(...)):
+    """
+    Upload a document to Azure Blob Storage and return a SAS link
+    that opens inline (not download).
+    """
+    try:
+        # ✅ Validate file type
+        allowed_types = [
+            "application/pdf",
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "text/plain",
+            "image/jpeg",
+            "image/png",
+        ]
+        if file.content_type not in allowed_types:
+            return {"success": False, "error": f"Unsupported file type: {file.content_type}"}
+
+        # ✅ Create unique blob name
+        timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        blob_name = f"{timestamp}_{file.filename}"
+
+        # ✅ Upload file with inline content settings
+        blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=blob_name)
+        file_data = await file.read()
+        blob_client.upload_blob(
+            file_data,
+            overwrite=True,
+            content_settings=ContentSettings(
+                content_type=file.content_type,
+                content_disposition="inline",  # 👈 ensures browser displays
+                cache_control="no-cache"
+            ),
+        )
+
+        # ✅ Generate SAS URL with inline override
+        sas_token = generate_blob_sas(
+            account_name="profilepicture123",
+            container_name=CONTAINER_NAME,
+            blob_name=blob_name,
+            account_key=ACCOUNT_KEY,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.utcnow() + timedelta(hours=1),
+            content_disposition="inline",      # 👈 override in SAS
+            content_type=file.content_type     # 👈 ensure correct type
+        )
+
+        sas_url = f"{ACCOUNT_URL}{CONTAINER_NAME}/{blob_name}?{sas_token}"
+
+        return {
+            "success": True,
+            "message": "Document uploaded successfully",
+            "document_link": sas_url,
+            "file_name": file.filename,
+            "uploaded_as": blob_name,
+        }
 
     except Exception as e:
         return {"success": False, "error": str(e)}

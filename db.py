@@ -339,23 +339,35 @@ def fhir_preop_checklist_resources(uhid: str, checklist: PreOpChecklist) -> dict
             "author": [{"display": d.assigned_by}],
             "authenticator": {"display": d.validated_by or "N/A"},
             "custodian": {"display": d.updated_by},
-            "date": d.updated_timestamp.isoformat(),
+            # ✅ Safe datetime handling
+            "date": d.updated_timestamp.isoformat() if d.updated_timestamp else None,
             "description": f"Validation Timestamp: {d.validation_timestamp.isoformat() if d.validation_timestamp else 'N/A'}",
             "content": [
                 {
                     "attachment": {
                         "url": d.document_link,
                         "title": d.document_name,
-                        "creation": d.assigned_timestamp.isoformat()
+                        "creation": d.assigned_timestamp.isoformat() if d.assigned_timestamp else None
                     }
                 }
             ],
             "meta": {"profile": [f"{FHIR_BASE_PROFILE}/DocumentReference"]}
         }
 
-        entries.append({"resource": doc, "request": {"method": "POST", "url": "DocumentReference"}})
+        # ✅ Clean up None fields (FHIR spec discourages nulls)
+        clean_doc = {k: v for k, v in doc.items() if v is not None}
 
-    return {"resourceType": "Bundle", "type": "transaction", "entry": entries}
+        entries.append({
+            "resource": clean_doc,
+            "request": {"method": "POST", "url": "DocumentReference"}
+        })
+
+    return {
+        "resourceType": "Bundle",
+        "type": "transaction",
+        "entry": entries
+    }
+
 
 
 
